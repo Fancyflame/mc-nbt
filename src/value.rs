@@ -4,7 +4,6 @@ use std::{
     error::Error,
     fmt,
     io::{Error as IError, ErrorKind, Read, Result as IResult, Write},
-    ops::{ Index, IndexMut }
 };
 
 macro_rules! _get_num {
@@ -56,6 +55,7 @@ macro_rules! _gen_enum {
             ///```
             pub const fn name(id:u8)->Option<&'static str>{
                 match id{
+                    0=>Some("TAG_End"),
                     $(
                         $id=>Some(concat!("TAG_",stringify!($name))),
                     )*
@@ -82,8 +82,8 @@ macro_rules! _gen_enum {
             ///todo!();
             ///```
             #[inline]
-            pub fn from_reader<R:Read>(r: &mut R, e:Endian)->IResult<Value>{
-                Value::from_reader_raw(Value::read_id(r).expect("error!"), r, e)
+            pub fn from_reader<R:Read>(mut r: &mut R, e:Endian)->IResult<Value>{
+                Value::from_reader_raw(Value::read_id(r).expect("error!"), &mut r, e)
             }
 
             fn from_reader_raw<R:Read>(id:u8, r: &mut R, e:Endian)->IResult<Value>{
@@ -99,8 +99,8 @@ macro_rules! _gen_enum {
             }
 
             #[inline]
-            pub fn to_writer<W:Write>(&self,w:&mut W,e:Endian)->IResult<()>{
-                self.to_writer_raw(None,w,e)
+            pub fn to_writer<W:Write>(&self,mut w:W,e:Endian)->IResult<()>{
+                self.to_writer_raw(None,&mut w,e)
             }
 
             fn to_writer_raw<W:Write>(&self, check_id:Option<u8>, w:&mut W, e:Endian)->IResult<()>{
@@ -138,7 +138,7 @@ macro_rules! _gen_enum {
 
             impl TryInto<$inner> for Value{
                 type Error=ConvertError;
-                fn try_into(self)->Result<$inner,Self::Error>{
+                fn try_into(self)->std::result::Result<$inner,Self::Error>{
                     match self{
                         Value::$name(v)=>Ok(v),
                         other=>Err(ConvertError(Value::name(other.id()).unwrap()))
@@ -194,45 +194,24 @@ macro_rules! _impl_nbtval_for_numarr {
     };
 }
 
-/*
-#[derive(Clone,Copy,Debug)]
-pub struct ID(u8);
+pub type Compound = HashMap<String, Value>;
 
-impl ID{
-    pub fn new(input:u8)->Result<Self,InvalidIDError>{
-        if input>12 {
-            Err(InvalidIDError(input))
-        }else{
-            Ok(ID(u8))
-        }
-    }
+pub type Result<T> = std::result::Result<T, ParseError>;
 
-    #[inline]
-    pub fn get(&self)->u8{
-        self.0
-    }
-}
-
-
-#[derive(Debug)]
-pub struct InvalidIDError(u8);
-impl fmt::Display for ConvertError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Value of an ID must be between 0 and 12, given u8 is invalid: {}", self.0)
-    }
-}
-impl Error for InvalidIDError{}
-*/
-
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ConvertError(&'static str);
-impl fmt::Display for ConvertError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Cannot convert `{}` into given type", self.0)
-    }
+
+#[derive(Clone, Debug)]
+pub struct List {
+    pub type_id: u8,
+    pub vec: Vec<Value>,
 }
-impl Error for ConvertError {}
+
+#[derive(Clone, Debug)]
+pub struct Root {
+    title: String,
+    value: Compound,
+}
 
 #[derive(Clone, Copy)]
 pub enum Endian {
@@ -240,8 +219,15 @@ pub enum Endian {
     Big,
 }
 
+#[derive(Debug)]
+pub enum ParseError {
+    IoError(IError),
+    UnexpectedEndTag,
+    InvalidId(u8),
+    TagMismatched { expect: u8, found: u8 },
+}
+
 _gen_enum! {
-    End(()) = 0,
     Byte(i8) = 1,
     Short(i16) = 2,
     Int(i32) = 3,
@@ -265,52 +251,35 @@ _impl_nbtval_for_num!(i8, i16, i32, i64, f32, f64);
 
 _impl_nbtval_for_numarr!(i8, i32, i64);
 
-impl NbtValue for () {
-    #[inline]
-    fn read_nbt<R: Read>(_: &mut R, _: Endian) -> IResult<Self> {
-        Ok(())
-    }
-
-    #[inline]
-    fn write_nbt<W: Write>(&self, _: &mut W, _: Endian) -> IResult<()> {
-        Ok(())
-    }
-}
-
 impl NbtValue for String {
     fn read_nbt<R: Read>(r: &mut R, e: Endian) -> IResult<Self> {
         let size = _get_num!(u16, r, e);
-        let mut v = vec![0u8;size as usize];
+        let mut v = vec![0u8; size as usize];
         dbg!(size);
         r.read_exact(&mut v).expect("error!");
-        String::from_utf8(v).map_err(|e|{
+        String::from_utf8(v).map_err(|e| {
             IError::new(
                 ErrorKind::InvalidData,
                 format!(
                     "String is not utf8 encoded. try convert forcedly: {:?}",
-                    String::from_utf8_lossy(&e.as_bytes())
-                )
+                    String::from_utf8_lossy(e.as_bytes())
+                ),
             )
         })
     }
 
     fn write_nbt<W: Write>(&self, w: &mut W, e: Endian) -> IResult<()> {
-        w.write(&{
+        w.write_all(&{
             let b = self.len() as u16;
             match e {
                 Endian::Big => b.to_be_bytes(),
                 Endian::Little => b.to_le_bytes(),
             }
-        }).expect("error!");
-        w.write(self.as_bytes()).expect("error!");
+        })
+        .expect("error!");
+        w.write_all(self.as_bytes()).expect("error!");
         Ok(())
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct List {
-    pub type_id: u8,
-    pub vec: Vec<Value>,
 }
 
 impl NbtValue for List {
@@ -344,21 +313,15 @@ impl NbtValue for List {
                             x.into_inner().unwrap()
                         ),
                     )
-                }).expect("error!");
+                })
+                .expect("error!");
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Compound {
-    pub name: String,
-    pub map: HashMap<String, Value>,
-}
-
 impl NbtValue for Compound {
     fn read_nbt<R: Read>(r: &mut R, e: Endian) -> IResult<Self> {
-        //let name = String::read_nbt(r, e).expect("error!");
         let mut map = HashMap::new();
         println!("open");
         loop {
@@ -366,57 +329,89 @@ impl NbtValue for Compound {
                 0 => break,
                 type_id => {
                     let name = String::read_nbt(r, e).expect("error!");
-                    println!("insert: {}, {:?}",name,Value::name(type_id));
+                    println!("insert: {}, {:?}", name, Value::name(type_id));
                     let val = Value::from_reader_raw(type_id, r, e).expect("error!");
                     map.insert(name, val);
                 }
             }
         }
         println!("close");
-        Ok(Compound { name:"".into(), map })
+        Ok(map)
     }
 
     fn write_nbt<W: Write>(&self, w: &mut W, e: Endian) -> IResult<()> {
-        self.name.write_nbt(w, e).expect("error!");
-        for (index, x) in self.map.iter().enumerate() {
-            match x {
-                (name, Value::End(_)) => {
-                    return Err(IError::new(
-                        ErrorKind::InvalidData,
-                        format!(
-                        "err occurred at index {}: Cannot contain TAG_End in Compond (key: `{}`)",
-                        index, name
-                    ),
-                    ))
-                }
-                (name, val) => {
-                    w.write_all(&[val.id()]).expect("error!");
-                    name.write_nbt(w, e).expect("error!");
-                    val.to_writer_raw(None, w, e).expect("error!");
-                }
-            }
+        for x in self.iter() {
+            let (name, val) = x;
+            w.write_all(&[val.id()]).expect("error!");
+            name.write_nbt(w, e).expect("error!");
+            val.to_writer_raw(None, w, e).expect("error!");
         }
         w.write_all(&[0]).expect("error!"); //TAG_End
         Ok(())
     }
 }
 
-impl Index<&str> for Compound{
-    type Output=Value;
-    #[inline]
-    fn index(&self,i:&str)->&Value{
-        &self.map[i]
+impl Root {
+    fn from_reader<R: Read>(r: &mut R, e: Endian) -> Result<Self> {
+        {
+            let id = Value::read_id(r)?;
+            if id != 10 {
+                return Err(ParseError::TagMismatched {
+                    expect: 10,
+                    found: id,
+                });
+            }
+        }
+        todo!();
     }
 }
 
-impl Compound{
-    #[inline]
-    fn get<'a>(&'a self,i:&str)->Option<&'a Value>{
-        self.map.get(i)
+impl fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Cannot convert `{}` into given type", self.0)
     }
+}
 
+impl Error for ConvertError {}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::InvalidId(id) => write!(
+                f,
+                "Invalid id was read: {}. An id must equal or less than 12.",
+                id
+            ),
+            ParseError::IoError(ref err) => {
+                write!(f, "An IO error was occurred");
+                match err.kind() {
+                    ErrorKind::UnexpectedEof => write!(
+                        f,
+                        ": Read unexpected end of stream, maybe the data was damaged."
+                    ),
+                    _ => write!(f, ", error info: {}", err),
+                }
+            }
+            ParseError::TagMismatched { expect, found } => {
+                write!(
+                    f,
+                    "Tag read was mismatched: expect {}, found {}",
+                    Value::name(*expect).expect("This id was invalid before mismatched!"),
+                    Value::name(*found).expect("This id was invalid before mismatched!")
+                )
+            }
+            ParseError::UnexpectedEndTag => {
+                write!(f, "End tag can only appear at the end of a compond.")
+            }
+        }
+    }
+}
+
+impl Error for ParseError {}
+
+impl From<IError> for ParseError {
     #[inline]
-    fn get_mut<'a>(&'a mut self,i:&str)->Option<&'a mut Value>{
-        self.map.get_mut(i)
+    fn from(e: IError) -> Self {
+        ParseError::IoError(e)
     }
 }

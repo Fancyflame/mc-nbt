@@ -7,4 +7,4 @@ mod tests {
 }
 
 pub mod value;
-pub use value::{ Value, Endian };
+pub use value::{Endian, Value};
